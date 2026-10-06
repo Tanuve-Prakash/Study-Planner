@@ -19,6 +19,9 @@ type Readiness = {
   explanation: string
 }
 type Assignment = { id: string; title: string; due_date: string }
+type WeekDay = { day: string; scheduled: number; done: number }
+type SubjectCount = { name: string; count: number }
+type LastReplan = { missed: number; created: number; when: string; subjects: SubjectCount[] }
 
 const today = () => new Date().toLocaleDateString('en-CA')
 const daysTo = (d: string) => {
@@ -26,6 +29,10 @@ const daysTo = (d: string) => {
   const [ty, tm, td] = today().split('-').map(Number)
   return Math.round((new Date(y, m - 1, day).getTime() - new Date(ty, tm - 1, td).getTime()) / 86400000)
 }
+
+// NEW: actual studied hours (from start/end time) with fallback to planned duration
+const hoursOf = (x: any) => Number(x.actual_hours ?? x.duration_hours ?? 0)
+const round1 = (n: number) => Math.round(n * 10) / 10
 
 export default function DashboardPage() {
   const router = useRouter()
@@ -35,10 +42,15 @@ export default function DashboardPage() {
   const [assignments, setAssignments] = useState<Assignment[]>([])
   const [todayStats, setTodayStats] = useState({ planned: 0, done: 0, missed: 0, hours: 0 })
   const [pendingMissed, setPendingMissed] = useState(0)
+  const [missedBySubject, setMissedBySubject] = useState<SubjectCount[]>([])
+  const [week, setWeek] = useState<WeekDay[]>([])
+  const [lastReplan, setLastReplan] = useState<LastReplan | null>(null)
   const [hours, setHours] = useState(3)
   const [simulating, setSimulating] = useState(false)
   const [msg, setMsg] = useState('')
   const [busy, setBusy] = useState(false)
+  const [coach, setCoach] = useState('')
+  const [coachBusy, setCoachBusy] = useState(false)
 
   async function loadAll() {
     const { data: auth } = await supabase.auth.getUser()
@@ -60,20 +72,58 @@ export default function DashboardPage() {
       .eq('status', 'pending').gte('due_date', today()).order('due_date')
     setAssignments((a as Assignment[]) ?? [])
 
-    const { data: s } = await supabase.from('study_sessions').select('session_date,status,duration_hours')
+    const { data: s } = await supabase.from('study_sessions').select('*')
     const t = today()
-    const rows = s ?? []
-    const todayRows = rows.filter((x: any) => x.session_date === t)
+    const rows: any[] = s ?? []
+
+    // Today's stats
+    const todayRows = rows.filter(x => x.session_date === t)
     setTodayStats({
-      planned: todayRows.filter((x: any) => x.status === 'planned').length,
-      done: todayRows.filter((x: any) => x.status === 'done').length,
-      missed: todayRows.filter((x: any) => x.status === 'missed').length,
-      hours: todayRows.filter((x: any) => x.status === 'done').reduce((n: number, x: any) => n + Number(x.duration_hours), 0),
+      planned: todayRows.filter(x => x.status === 'planned').length,
+      done: todayRows.filter(x => x.status === 'done').length,
+      missed: todayRows.filter(x => x.status === 'missed').length,
+      // CHANGED: uses real studied hours instead of planned duration
+      hours: round1(todayRows.filter(x => x.status === 'done').reduce((n, x) => n + hoursOf(x), 0)),
     })
-    setPendingMissed(rows.filter((x: any) => x.status === 'planned' && x.session_date < t).length)
+
+    // Unfinished past sessions, grouped by subject
+    const pastPlanned = rows.filter(x => x.status === 'planned' && x.session_date < t)
+    setPendingMissed(pastPlanned.length)
+    const nameById: Record<string, string> = {}
+    ;((p as Progress[]) ?? []).forEach(x => { nameById[x.subject_id] = x.name })
+    const counts: Record<string, number> = {}
+    pastPlanned.forEach(x => {
+      const n = nameById[x.subject_id] ?? ''
+      if (n) counts[n] = (counts[n] ?? 0) + 1
+    })
+    setMissedBySubject(Object.entries(counts).map(([name, count]) => ({ name, count })))
+
+    // Weekly progress (last 7 days)
+    const last7 = Array.from({ length: 7 }, (_, i) => {
+      const d = new Date()
+      d.setDate(d.getDate() - (6 - i))
+      return d.toLocaleDateString('en-CA')
+    })
+    setWeek(last7.map(d => {
+      const day = rows.filter(x => x.session_date === d)
+      return {
+        day: new Date(d + 'T00:00:00').toLocaleDateString('en-US', { weekday: 'short' }),
+        scheduled: round1(day.reduce((n, x) => n + Number(x.duration_hours), 0)),
+        // CHANGED: uses real studied hours instead of planned duration
+        done: round1(day.filter(x => x.status === 'done').reduce((n, x) => n + hoursOf(x), 0)),
+      }
+    }))
   }
 
-  useEffect(() => { loadAll() /* eslint-disable-next-line */ }, [])
+  useEffect(() => {
+    loadAll()
+    // Restore the last replan summary so it survives a page refresh
+    try {
+      const saved = localStorage.getItem('lastReplan')
+      if (saved) setLastReplan(JSON.parse(saved))
+    } catch { /* ignore */ }
+    // eslint-disable-next-line
+  }, [])
 
   // What-if slider: recalculates readiness live, saves nothing
   useEffect(() => {
@@ -87,12 +137,45 @@ export default function DashboardPage() {
 
   async function fellBehind() {
     setBusy(true); setMsg('')
+    const snapshot = missedBySubject // subjects that had unfinished sessions before replanning
     try {
       const r = await replan(today())
       setMsg(`Plan updated: ${r.missed} missed sessions rescheduled, ${r.created} new sessions created`)
+      const summary: LastReplan = {
+        missed: r.missed, created: r.created, subjects: snapshot,
+        when: new Date().toLocaleString('en-GB', { dateStyle: 'medium', timeStyle: 'short' }),
+      }
+      setLastReplan(summary)
+      try { localStorage.setItem('lastReplan', JSON.stringify(summary)) } catch { /* ignore */ }
       await loadAll()
     } catch (e: any) { setMsg('Error: ' + e.message) }
     setBusy(false)
+  }
+
+  async function askCoach() {
+    setCoachBusy(true); setCoach('')
+    try {
+      const summary = {
+        daily_hours: hours,
+        missed_unfinished_sessions: pendingMissed,
+        today: todayStats,
+        this_week: { hours_scheduled: weekScheduled, hours_done: weekDone },
+        exams: readiness.map(r => ({
+          subject: r.subject_name, days_left: r.days_left,
+          projected_readiness_pct: Math.round(Number(r.projected_pct)),
+          status: r.status, hours_needed: r.hours_needed, hours_available: r.hours_available,
+        })),
+        assignments: assignments.map(a => ({ title: a.title, days_left: daysTo(a.due_date) })),
+      }
+      const res = await fetch('/api/coach', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ summary }),
+      })
+      const data = await res.json()
+      setCoach(data.text ?? 'Coach error: ' + data.error)
+    } catch (e: any) { setCoach('Coach error: ' + e.message) }
+    setCoachBusy(false)
   }
 
   const totalTopics = progress.reduce((n, p) => n + Number(p.total_topics), 0)
@@ -100,6 +183,9 @@ export default function DashboardPage() {
   const overall = totalTopics ? Math.round((100 * doneTopics) / totalTopics) : 0
   const donut = [{ name: 'Done', value: overall }, { name: 'Left', value: 100 - overall }]
   const atRisk = readiness.filter(r => r.status === 'at_risk')
+  const weekScheduled = round1(week.reduce((n, d) => n + d.scheduled, 0))
+  const weekDone = round1(week.reduce((n, d) => n + d.done, 0))
+  const weekPct = weekScheduled ? Math.round((100 * weekDone) / weekScheduled) : 0
 
   return (
     <main className="mx-auto max-w-6xl space-y-5 p-4">
@@ -116,9 +202,37 @@ export default function DashboardPage() {
 
       {msg && <p className="rounded bg-blue-50 p-2 text-blue-800">{msg}</p>}
       {pendingMissed > 0 && (
-        <p className="rounded bg-orange-50 p-2 text-orange-800">
-          You have {pendingMissed} unfinished past session(s). Click "I fell behind" to reschedule them.
-        </p>
+        <div className="rounded bg-orange-50 p-2 text-orange-800">
+          <p>
+            You have {pendingMissed} unfinished past session(s). Click &quot;I fell behind&quot; to reschedule them.
+          </p>
+          {missedBySubject.length > 0 && (
+            <p className="mt-1 text-sm">
+              Affected subjects: {missedBySubject.map(m => `${m.name} (${m.count})`).join(', ')}
+            </p>
+          )}
+        </div>
+      )}
+
+      {/* Last rescheduled summary */}
+      {lastReplan && (
+        <section className="rounded-xl border border-orange-200 bg-white p-4">
+          <h2 className="font-semibold text-orange-600">Last rescheduled</h2>
+          <p className="text-sm text-gray-600">
+            {lastReplan.when}: {lastReplan.missed} missed session(s) moved, {lastReplan.created} new session(s) created.
+          </p>
+          {lastReplan.subjects.length > 0 ? (
+            <ul className="mt-2 flex flex-wrap gap-2 text-sm">
+              {lastReplan.subjects.map(s => (
+                <li key={s.name} className="rounded-full bg-orange-100 px-3 py-1 text-orange-800">
+                  {s.name}: {s.count} session(s)
+                </li>
+              ))}
+            </ul>
+          ) : (
+            <p className="mt-1 text-xs text-gray-400">Subject names are not available for this update.</p>
+          )}
+        </section>
       )}
 
       {/* Top row */}
@@ -168,6 +282,26 @@ export default function DashboardPage() {
         </section>
       </div>
 
+      {/* Weekly progress */}
+      <section className="rounded-xl border bg-white p-4">
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <h2 className="font-semibold">Weekly progress (last 7 days)</h2>
+          <span className="text-sm text-gray-600">
+            {weekDone}h of {weekScheduled}h studied ({weekPct}%)
+          </span>
+        </div>
+        <div className="mt-2 h-56">
+          <ResponsiveContainer>
+            <BarChart data={week}>
+              <CartesianGrid strokeDasharray="3 3" />
+              <XAxis dataKey="day" /><YAxis /><Tooltip />
+              <Bar dataKey="scheduled" name="Scheduled (h)" fill="#bfdbfe" />
+              <Bar dataKey="done" name="Done (h)" fill="#2563eb" />
+            </BarChart>
+          </ResponsiveContainer>
+        </div>
+      </section>
+
       {/* Readiness + slider */}
       <section className="rounded-xl border bg-white p-4">
         <h2 className="text-lg font-semibold">Exam readiness</h2>
@@ -195,6 +329,18 @@ export default function DashboardPage() {
             </div>
           ))}
         </div>
+      </section>
+
+      {/* AI coach */}
+      <section className="rounded-xl border border-purple-200 bg-purple-50 p-4">
+        <div className="flex items-center justify-between">
+          <h2 className="font-semibold text-purple-700">AI Study Coach</h2>
+          <button onClick={askCoach} disabled={coachBusy}
+            className="rounded-lg bg-purple-600 px-4 py-2 text-white hover:bg-purple-700 disabled:opacity-50">
+            {coachBusy ? 'Thinking...' : 'Get my weekly advice'}
+          </button>
+        </div>
+        {coach && <p className="mt-3 whitespace-pre-line text-sm">{coach}</p>}
       </section>
 
       {/* Needs more time */}

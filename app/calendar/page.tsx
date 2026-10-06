@@ -24,6 +24,8 @@ type Session = {
   status: 'planned' | 'done' | 'missed'
   reason: string | null
   title: string
+  started_at: string | null
+  ended_at: string | null
 }
 
 type EventT = { title: string; start: Date; end: Date; session: Session; color: string }
@@ -33,6 +35,8 @@ function localDate(s: string, hour: number) {
   return new Date(y, m - 1, d, hour, 0)
 }
 
+const pad = (n: number) => String(n).padStart(2, '0')
+
 export default function CalendarPage() {
   const router = useRouter()
   const [events, setEvents] = useState<EventT[]>([])
@@ -40,6 +44,7 @@ export default function CalendarPage() {
   const [confidence, setConfidence] = useState(3)
   const [msg, setMsg] = useState('')
   const [busy, setBusy] = useState(false)
+  const [elapsed, setElapsed] = useState(0) // seconds since Start was pressed
 
   async function load() {
     const { data: auth } = await supabase.auth.getUser()
@@ -80,6 +85,16 @@ export default function CalendarPage() {
 
   useEffect(() => { load() /* eslint-disable-next-line */ }, [])
 
+  // Live clock while a session is running
+  useEffect(() => {
+    if (!selected?.started_at || selected.ended_at) { setElapsed(0); return }
+    const begin = new Date(selected.started_at).getTime()
+    const tick = () => setElapsed(Math.max(0, Math.floor((Date.now() - begin) / 1000)))
+    tick()
+    const id = setInterval(tick, 1000)
+    return () => clearInterval(id)
+  }, [selected?.started_at, selected?.ended_at])
+
   async function generate() {
     setBusy(true); setMsg('')
     try {
@@ -90,8 +105,30 @@ export default function CalendarPage() {
     setBusy(false)
   }
 
+  async function startStudying() {
+    if (!selected) return
+    const now = new Date().toISOString()
+    const { error } = await supabase
+      .from('study_sessions')
+      .update({ started_at: now, ended_at: null })
+      .eq('id', selected.id)
+    if (error) { setMsg('Error: ' + error.message); return }
+    setSelected({ ...selected, started_at: now, ended_at: null })
+    await load()
+  }
+
   async function markDone() {
     if (!selected) return
+
+    // If the timer is running, save the end time first
+    if (selected.started_at && !selected.ended_at) {
+      const { error: endErr } = await supabase
+        .from('study_sessions')
+        .update({ ended_at: new Date().toISOString() })
+        .eq('id', selected.id)
+      if (endErr) { setMsg('Error: ' + endErr.message); return }
+    }
+
     const { error } = await supabase.rpc('complete_session', {
       p_session_id: selected.id, p_confidence: confidence,
     })
@@ -100,6 +137,18 @@ export default function CalendarPage() {
     setSelected(null)
     await load()
   }
+
+  // Text for sessions that already have both start and end times
+  const studiedText = (() => {
+    if (!selected?.started_at || !selected.ended_at) return ''
+    const mins = Math.round(
+      (new Date(selected.ended_at).getTime() - new Date(selected.started_at).getTime()) / 60000
+    )
+    return `${Math.floor(mins / 60)}h ${mins % 60}m`
+  })()
+
+  const running = !!selected?.started_at && !selected?.ended_at
+  const clock = `${pad(Math.floor(elapsed / 3600))}:${pad(Math.floor((elapsed % 3600) / 60))}:${pad(elapsed % 60)}`
 
   return (
     <main className="mx-auto max-w-5xl p-4">
@@ -149,6 +198,39 @@ export default function CalendarPage() {
             <h3 className="mt-4 font-semibold text-blue-700">Why this session?</h3>
             <p className="rounded bg-blue-50 p-3 text-sm">{selected.reason ?? 'No reason saved.'}</p>
 
+            {/* Study timer */}
+            <div className="mt-4 rounded-lg bg-gray-50 p-3">
+              <h3 className="mb-1 text-sm font-semibold">Study timer</h3>
+
+              {studiedText ? (
+                <p className="text-sm text-green-700">
+                  Studied for {studiedText}
+                  {selected.started_at && selected.ended_at && (
+                    <span className="block text-xs text-gray-500">
+                      {new Date(selected.started_at).toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit' })}
+                      {' to '}
+                      {new Date(selected.ended_at).toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit' })}
+                    </span>
+                  )}
+                </p>
+              ) : running ? (
+                <div className="flex items-center justify-between">
+                  <span className="font-mono text-2xl">{clock}</span>
+                  <span className="text-xs text-gray-500">
+                    Started {new Date(selected.started_at!).toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit' })}.
+                    Press Mark done when you finish.
+                  </span>
+                </div>
+              ) : selected.status !== 'done' ? (
+                <button onClick={startStudying}
+                  className="rounded-lg bg-green-600 px-4 py-2 text-sm text-white hover:bg-green-700">
+                  Start studying
+                </button>
+              ) : (
+                <p className="text-xs text-gray-500">No study time was recorded for this session.</p>
+              )}
+            </div>
+
             {selected.status !== 'done' && (
               <div className="mt-4">
                 <label className="block text-sm font-medium">How well did you understand it? (1 to 5)</label>
@@ -162,7 +244,7 @@ export default function CalendarPage() {
               <button onClick={() => setSelected(null)} className="rounded-lg border px-4 py-2">Close</button>
               {selected.status !== 'done' && (
                 <button onClick={markDone} className="rounded-lg bg-green-600 px-4 py-2 text-white hover:bg-green-700">
-                  Mark done
+                  {running ? 'Stop & mark done' : 'Mark done'}
                 </button>
               )}
             </div>
